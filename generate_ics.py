@@ -42,42 +42,27 @@ def _parse_date(date_text, fallback_date):
 
 def _extract_events(html, fallback_date):
     soup = BeautifulSoup(html, "html.parser")
-    lines = [ln.strip() for ln in soup.get_text("\n").split("\n")]
-    lines = [ln for ln in lines if ln]
+    text = soup.get_text("\n")
+    # Pull blocks like:
+    # Badminton ... Date: ... Time: ... Location: ... Spaces: ...
+    pattern = re.compile(
+        rf"\b{re.escape(ACTIVITY_NAME)}\b.*?Date:\s*(.*?)\s*Time:\s*(.*?)\s*Location:\s*(.*?)\s*Spaces:",
+        re.IGNORECASE | re.DOTALL,
+    )
 
     events = []
-    i = 0
-    while i < len(lines):
-        name = lines[i]
-        if name.lower() == ACTIVITY_NAME.lower():
-            date_line = ""
-            time_line = ""
-            location_line = ""
-            j = i + 1
-            while j < len(lines) and j < i + 12:
-                if lines[j].startswith("Date:"):
-                    date_line = lines[j]
-                elif lines[j].startswith("Time:"):
-                    time_line = lines[j]
-                elif lines[j].startswith("Location:"):
-                    location_line = lines[j]
-                if date_line and time_line and location_line:
-                    break
-                j += 1
-
-            if date_line and time_line and location_line:
-                date_obj = _parse_date(date_line, fallback_date)
-                start_dt, end_dt = _parse_time_range(date_obj, time_line)
-                if start_dt and end_dt:
-                    location = location_line.replace("Location:", "").strip()
-                    events.append({
-                        "name": ACTIVITY_NAME,
-                        "start": start_dt,
-                        "end": end_dt,
-                        "location": location,
-                    })
-        i += 1
+    for date_str, time_str, location_str in pattern.findall(text):
+        date_obj = _parse_date("Date: " + date_str.strip(), fallback_date)
+        start_dt, end_dt = _parse_time_range(date_obj, "Time: " + time_str.strip())
+        if start_dt and end_dt:
+            events.append({
+                "name": ACTIVITY_NAME,
+                "start": start_dt,
+                "end": end_dt,
+                "location": location_str.strip(),
+            })
     return events
+
 
 def _uid_for(evt):
     raw = f"{evt['name']}|{evt['start'].isoformat()}|{evt['end'].isoformat()}|{evt['location']}"
@@ -114,7 +99,12 @@ def main():
     for offset in range(DAYS_AHEAD):
         day = today + timedelta(days=offset)
         url = BASE_URL.format(date=day.isoformat())
-        res = requests.get(url, timeout=20)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
+            "Accept-Language": "en-CA,en;q=0.9",
+        }
+        res = requests.get(url, headers=headers, timeout=20)
+
         res.raise_for_status()
         day_events = _extract_events(res.text, day)
         all_events.extend(day_events)
