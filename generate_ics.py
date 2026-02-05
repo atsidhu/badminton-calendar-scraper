@@ -1,5 +1,6 @@
 import hashlib
 import re
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -18,6 +19,16 @@ DAYS_AHEAD = 7
 ACTIVITY_NAME = "Badminton"
 OUTPUT_PATH = "docs/calendar.ics"
 
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-CA,en;q=0.9",
+}
+
+
 def _parse_time_range(date_obj, time_text):
     # Example: "9:00 AM - 5:15 PM (495 mins)"
     m = re.search(r"(\d{1,2}:\d{2}\s*[AP]M)\s*-\s*(\d{1,2}:\d{2}\s*[AP]M)", time_text)
@@ -32,6 +43,7 @@ def _parse_time_range(date_obj, time_text):
     )
     return start_dt, end_dt
 
+
 def _parse_date(date_text, fallback_date):
     # Example: "Tue, 03-Feb-26"
     m = re.search(r"\b[A-Za-z]{3},\s*\d{2}-[A-Za-z]{3}-\d{2}\b", date_text)
@@ -40,9 +52,11 @@ def _parse_date(date_text, fallback_date):
     # Fallback: use the date we requested
     return fallback_date
 
+
 def _extract_events(html, fallback_date):
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text("\n")
+
     # Pull blocks like:
     # Badminton ... Date: ... Time: ... Location: ... Spaces: ...
     pattern = re.compile(
@@ -55,18 +69,74 @@ def _extract_events(html, fallback_date):
         date_obj = _parse_date("Date: " + date_str.strip(), fallback_date)
         start_dt, end_dt = _parse_time_range(date_obj, "Time: " + time_str.strip())
         if start_dt and end_dt:
-            events.append({
-                "name": ACTIVITY_NAME,
-                "start": start_dt,
-                "end": end_dt,
-                "location": location_str.strip(),
-            })
+            events.append(
+                {
+                    "name": ACTIVITY_NAME,
+                    "start": start_dt,
+                    "end": end_dt,
+                    "location": location_str.strip(),
+                }
+            )
     return events
 
 
+def merge_events_ignore_location(events, merge_gap_minutes=0):
+    """
+    Merge overlapping (or adjacent) events per day, ignoring location.
+    If merge_gap_minutes > 0, also merge events that are within that gap.
+    """
+    if not events:
+        return []
+
+    gap = timedelta(minutes=merge_gap_minutes)
+
+    # group by local date
+    by_day = defaultdict(list)
+    for e in events:
+        by_day[e["start"].date()].append(e)
+
+    merged = []
+    for _, day_events in by_day.items():
+        day_events.sort(key=lambda e: e["start"])
+
+        cur_start = day_events[0]["start"]
+        cur_end = day_events[0]["end"]
+
+        for e in day_events[1:]:
+            s, t = e["start"], e["end"]
+            # overlap or "touch" (or within gap)
+            if s <= cur_end + gap:
+                if t > cur_end:
+                    cur_end = t
+            else:
+                merged.append(
+                    {
+                        "name": ACTIVITY_NAME,
+                        "start": cur_start,
+                        "end": cur_end,
+                        "location": "Genesis Centre",
+                    }
+                )
+                cur_start, cur_end = s, t
+
+        merged.append(
+            {
+                "name": ACTIVITY_NAME,
+                "start": cur_start,
+                "end": cur_end,
+                "location": "Genesis Centre",
+            }
+        )
+
+    merged.sort(key=lambda e: e["start"])
+    return merged
+
+
 def _uid_for(evt):
-    raw = f"{evt['name']}|{evt['start'].isoformat()}|{evt['end'].isoformat()}|{evt['location']}"
+    # UID must be stable for the same logical event; include name + times.
+    raw = f"{evt['name']}|{evt['start'].isoformat()}|{evt['end'].isoformat()}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest() + "@genesis-dropin"
+
 
 def generate_ics(events):
     lines = []
@@ -84,13 +154,14 @@ def generate_ics(events):
         lines.append(f"DTSTAMP:{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}")
         lines.append(f"DTSTART:{start_utc.strftime('%Y%m%dT%H%M%SZ')}")
         lines.append(f"DTEND:{end_utc.strftime('%Y%m%dT%H%M%SZ')}")
-        lines.append(f"SUMMARY:{evt['name']}")
+        lines.append(f"SUMMARY:{evt['name']} (Drop-in window)")
         lines.append(f"LOCATION:{evt['location']}")
         lines.append("DESCRIPTION:Genesis Centre Drop-In Calendar (Badminton)")
         lines.append("END:VEVENT")
 
     lines.append("END:VCALENDAR")
     return "\r\n".join(lines) + "\r\n"
+
 
 def main():
     today = datetime.now(TZ).date()
@@ -99,21 +170,23 @@ def main():
     for offset in range(DAYS_AHEAD):
         day = today + timedelta(days=offset)
         url = BASE_URL.format(date=day.isoformat())
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
-            "Accept-Language": "en-CA,en;q=0.9",
-        }
-        res = requests.get(url, headers=headers, timeout=20)
-
+        res = requests.get(url, headers=HEADERS, timeout=20)
         res.raise_for_status()
+
         day_events = _extract_events(res.text, day)
         all_events.extend(day_events)
 
+    # Merge overlapping events per day (ignore location/court)
+    all_events = merge_events_ignore_location(all_events, merge_gap_minutes=0)
+
     ics = generate_ics(all_events)
+
     import os
+
     os.makedirs("docs", exist_ok=True)
     with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
         f.write(ics)
+
 
 if __name__ == "__main__":
     main()
